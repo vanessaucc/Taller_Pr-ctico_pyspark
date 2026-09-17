@@ -1,97 +1,120 @@
 import os
 from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
+from pyspark.sql.functions import col, countDistinct, sum as _sum, desc, month, year, concat_ws, avg, min as _min, max as _max
 
-# 1. Lectura de datos
+# 1. Inicializar sesión de Spark
 spark = SparkSession.builder \
-    .appName("Taller ETL Online Retail") \
+    .appName("Taller_Practico_PySpark") \
     .getOrCreate()
 
-spark.sparkContext.setLogLevel("ERROR")
+spark.sparkContext.setLogLevel("WARN")
 
+# Rutas de archivos
 DATA_PATH = "data/Online_Retail.csv"
 OUTPUT_DIR = "src/outputs"
 
-# Lectura explícita usando spark.read.format("csv")
-df = spark.read.format("csv") \
-    .option("header", "true") \
-    .option("inferSchema", "true") \
-    .load(DATA_PATH)
-
-# Limpieza inicial y creación de columnas derivadas (withColumn)
-df_cleaned = df.withColumn("Quantity", F.col("Quantity").cast("integer")) \
-               .withColumn("UnitPrice", F.col("UnitPrice").cast("double")) \
-               .withColumn("CustomerID", F.col("CustomerID").cast("integer")) \
-               .withColumn("InvoiceDate", F.to_timestamp(F.col("InvoiceDate"))) \
-               .withColumn("TotalSpent", F.col("Quantity") * F.col("UnitPrice"))
-
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# 1. Total facturas (select, distinct, count)
-df_q1 = spark.createDataFrame([(df_cleaned.select("InvoiceNo").distinct().count(),)], ["total_facturas"])
-df_q1.coalesce(1).write.mode("overwrite").option("header", "true").format("csv").save(f"{OUTPUT_DIR}/q1_total_facturas.csv")
+# 2. Cargar y limpiar Dataset
+print("Cargando dataset...")
+df = spark.read.csv(DATA_PATH, header=True, inferSchema=True)
 
-# 2. Clientes únicos (filter, select, count)
-df_q2 = spark.createDataFrame([(df_cleaned.filter(F.col("CustomerID").isNotNull()).select("CustomerID").distinct().count(),)], ["total_clientes"])
-df_q2.coalesce(1).write.mode("overwrite").option("header", "true").format("csv").save(f"{OUTPUT_DIR}/q2_clientes_unicos.csv")
+df_clean = df.filter(col("InvoiceNo").isNotNull() & col("Quantity").isNotNull() & col("UnitPrice").isNotNull()) \
+             .withColumn("TotalAmount", col("Quantity") * col("UnitPrice"))
 
-# 3. Ingreso total (agg, sum)
-df_q3 = df_cleaned.agg(F.sum("TotalSpent").alias("ingreso_total"))
-df_q3.coalesce(1).write.mode("overwrite").option("header", "true").format("csv").save(f"{OUTPUT_DIR}/q3_ingreso_total.csv")
+df_clean.cache()
 
-# 4. Producto más vendido en cantidad + OPERACIÓN JOIN (join)
-df_catalogo = df_cleaned.select("StockCode", "Description").distinct()
+print("\n==========================================")
+print("   RESULTADOS DEL TALLER PYSPARK - ETL   ")
+print("==========================================\n")
 
-df_cantidades = df_cleaned.groupBy("StockCode") \
-    .agg(F.sum("Quantity").alias("total_cantidad")) \
-    .orderBy(F.desc("total_cantidad"))
+# Q1: Facturas únicas
+total_invoices = df_clean.select(countDistinct("InvoiceNo")).collect()[0][0]
+df_q1 = spark.createDataFrame([("Facturas Unicas", total_invoices)], ["Metrica", "Valor"])
 
-df_q4 = df_cantidades.join(df_catalogo, on="StockCode", how="inner") \
-    .select("StockCode", "Description", "total_cantidad") \
-    .orderBy(F.desc("total_cantidad"))
+# Q2: Clientes únicos
+total_customers = df_clean.filter(col("CustomerID").isNotNull()).select(countDistinct("CustomerID")).collect()[0][0]
+df_q2 = spark.createDataFrame([("Clientes Unicos", total_customers)], ["Metrica", "Valor"])
 
-df_q4.limit(10).coalesce(1).write.mode("overwrite").option("header", "true").format("csv").save(f"{OUTPUT_DIR}/q4_producto_mas_vendido.csv")
+# Q3: Ingreso total
+total_revenue = df_clean.select(_sum("TotalAmount")).collect()[0][0]
+df_q3 = spark.createDataFrame([("Ingreso Total", total_revenue)], ["Metrica", "Valor"])
 
-# 5. Cliente con mayor volumen de compra (groupBy, agg, orderBy)
-df_q5 = df_cleaned.filter(F.col("CustomerID").isNotNull()) \
-    .groupBy("CustomerID") \
-    .agg(F.sum("TotalSpent").alias("total_comprado")) \
-    .orderBy(F.desc("total_comprado"))
-df_q5.limit(10).coalesce(1).write.mode("overwrite").option("header", "true").format("csv").save(f"{OUTPUT_DIR}/q5_top_clientes.csv")
+# Q4: Producto más vendido en cantidad (JOIN)
+df_quantities = df_clean.groupBy("StockCode").agg(_sum("Quantity").alias("TotalQuantity"))
+df_descriptions = df_clean.select("StockCode", "Description").dropDuplicates(["StockCode"])
+df_q4 = df_quantities.join(df_descriptions, "StockCode").orderBy(desc("TotalQuantity"))
 
-# 6. Top 5 países fuera de Reino Unido (where/filter, limit)
-df_q6 = df_cleaned.where(F.col("Country") != "United Kingdom") \
-    .groupBy("Country") \
-    .agg(F.sum("TotalSpent").alias("total_comprado")) \
-    .orderBy(F.desc("total_comprado")) \
-    .limit(5)
-df_q6.coalesce(1).write.mode("overwrite").option("header", "true").format("csv").save(f"{OUTPUT_DIR}/q6_top_paises_fuera_uk.csv")
+# Q5: Cliente con mayor volumen de compra
+df_q5 = df_clean.filter(col("CustomerID").isNotNull()) \
+                .groupBy("CustomerID") \
+                .agg(_sum("TotalAmount").alias("TotalSpentCustomer")) \
+                .orderBy(desc("TotalSpentCustomer"))
 
-# 7. Ticket promedio por factura (avg)
-df_facturas = df_cleaned.groupBy("InvoiceNo").agg(F.sum("TotalSpent").alias("total_factura"))
-df_q7 = df_facturas.agg(F.avg("total_factura").alias("ticket_promedio"))
-df_q7.coalesce(1).write.mode("overwrite").option("header", "true").format("csv").save(f"{OUTPUT_DIR}/q7_ticket_promedio.csv")
+# Q6: Top 5 países (excluyendo UK)
+df_q6 = df_clean.filter(col("Country") != "United Kingdom") \
+                .groupBy("Country") \
+                .agg(_sum("TotalAmount").alias("TotalSpentCountry")) \
+                .orderBy(desc("TotalSpentCountry"))
 
-# 8. Mínimo, máximo y promedio por factura (min, max, avg)
-df_q8 = df_cleaned.groupBy("InvoiceNo").agg(F.sum("Quantity").alias("total_productos")).agg(
-    F.min("total_productos").alias("min_productos"),
-    F.max("total_productos").alias("max_productos"),
-    F.avg("total_productos").alias("promedio_productos")
+# Q7: Ticket promedio por factura
+df_invoice_metrics = df_clean.groupBy("InvoiceNo") \
+                             .agg(_sum("TotalAmount").alias("InvoiceTotal"),
+                                  _sum("Quantity").alias("InvoiceProducts"))
+avg_ticket = df_invoice_metrics.select(avg("InvoiceTotal")).collect()[0][0]
+df_q7 = spark.createDataFrame([("Ticket Promedio", avg_ticket)], ["Metrica", "Valor"])
+
+# Q8: Métricas de productos por factura
+df_q8 = df_invoice_metrics.select(
+    _min("InvoiceProducts").alias("MinProducts"),
+    _max("InvoiceProducts").alias("MaxProducts"),
+    avg("InvoiceProducts").alias("AvgProducts")
 )
-df_q8.coalesce(1).write.mode("overwrite").option("header", "true").format("csv").save(f"{OUTPUT_DIR}/q8_metricas_facturas.csv")
 
-# 9. Mes con más ventas (date_format)
-df_q9 = df_cleaned.withColumn("YearMonth", F.date_format("InvoiceDate", "yyyy-MM")) \
-    .groupBy("YearMonth") \
-    .agg(F.sum("TotalSpent").alias("total_ventas")) \
-    .orderBy(F.desc("total_ventas"))
-df_q9.coalesce(1).write.mode("overwrite").option("header", "true").format("csv").save(f"{OUTPUT_DIR}/q9_ventas_por_mes.csv")
+# Q9: Mes con mayor volumen de ventas
+df_q9 = df_clean.withColumn("YearMonth", concat_ws("-", year("InvoiceDate"), month("InvoiceDate"))) \
+                .groupBy("YearMonth") \
+                .agg(_sum("TotalAmount").alias("MonthlySales")) \
+                .orderBy(desc("MonthlySales"))
 
-# 10. Porcentaje de facturas con devoluciones
-total_f = df_cleaned.select("InvoiceNo").distinct().count()
-dev_f = df_cleaned.filter(F.col("Quantity") < 0).select("InvoiceNo").distinct().count()
-df_q10 = spark.createDataFrame([((dev_f / total_f) * 100,)], ["porcentaje_devoluciones"])
-df_q10.coalesce(1).write.mode("overwrite").option("header", "true").format("csv").save(f"{OUTPUT_DIR}/q10_porcentaje_devoluciones.csv")
+# Q10: Porcentaje de facturas con devoluciones
+total_returns = df_clean.filter(col("InvoiceNo").startswith("C")).select(countDistinct("InvoiceNo")).collect()[0][0]
+pct_returns = (total_returns / total_invoices) * 100
+df_q10 = spark.createDataFrame([("Porcentaje Devoluciones", pct_returns)], ["Metrica", "Valor"])
 
-print("Script ejecutado con éxito. Se han exportado los 10 análisis con la operación join() a src/outputs/")
+# Print de verificación en consola
+print(f"1. Facturas únicas: {total_invoices}")
+print(f"2. Clientes únicos: {total_customers}")
+print(f"3. Ingreso total: ${total_revenue:,.2f}")
+print("4. Top Productos:")
+df_q4.show(1, truncate=False)
+print("5. Top Cliente:")
+df_q5.show(1, truncate=False)
+print("6. Top Países:")
+df_q6.show(5, truncate=False)
+print(f"7. Ticket promedio: ${avg_ticket:,.2f}")
+print("8. Métricas productos:")
+df_q8.show()
+print("9. Mes top ventas:")
+df_q9.show(1)
+print(f"10. % Devoluciones: {pct_returns:.2f}%\n")
+
+# ==========================================
+# EXPORTACIÓN COMPLETA DE LAS 10 CONSULTAS
+# ==========================================
+print("Guardando las 10 consultas en src/outputs/...")
+
+df_q1.toPandas().to_csv(f"{OUTPUT_DIR}/q1_total_facturas.csv", index=False)
+df_q2.toPandas().to_csv(f"{OUTPUT_DIR}/q2_total_clientes.csv", index=False)
+df_q3.toPandas().to_csv(f"{OUTPUT_DIR}/q3_ingreso_total.csv", index=False)
+df_q4.limit(10).toPandas().to_csv(f"{OUTPUT_DIR}/q4_top_productos.csv", index=False)
+df_q5.limit(10).toPandas().to_csv(f"{OUTPUT_DIR}/q5_top_clientes.csv", index=False)
+df_q6.limit(10).toPandas().to_csv(f"{OUTPUT_DIR}/q6_top_paises.csv", index=False)
+df_q7.toPandas().to_csv(f"{OUTPUT_DIR}/q7_ticket_promedio.csv", index=False)
+df_q8.toPandas().to_csv(f"{OUTPUT_DIR}/q8_metricas_productos.csv", index=False)
+df_q9.limit(12).toPandas().to_csv(f"{OUTPUT_DIR}/q9_ventas_mensuales.csv", index=False)
+df_q10.toPandas().to_csv(f"{OUTPUT_DIR}/q10_porcentaje_devoluciones.csv", index=False)
+
+print("¡Las 10 consultas se han exportado correctamente!")
+
 spark.stop()

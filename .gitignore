@@ -1,0 +1,7 @@
+cat <<EOT > .gitignore
+.venv/
+_pycache_/
+.DS_Store
+data/*.csv
+data/*.xlsx
+EOT
